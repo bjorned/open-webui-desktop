@@ -124,7 +124,7 @@
 										class=" font-default text-xs"
 										in:fly={{ delay: 100, duration: 500, y: 10 }}
 									>
-										This might take a few minutes, We’ll notify you when it’s
+										This might take a few minutes, We'll notify you when it's
 										ready.
 									</div>
 
@@ -157,7 +157,9 @@
 									class="text-xs mt-3 text-gray-500 cursor-pointer"
 									in:fly={{ delay: 500, duration: 750, y: 10 }}
 									onclick={() => {
-										console.log('hi');
+										if (window?.electronAPI) {
+											window.electronAPI.connectExternalServer();
+										}
 									}}
 								>
 									To connect to an existing server, click here.

@@ -88,6 +88,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
 		return await ipcRenderer.invoke('server:url');
 	},
 
+	// New function to trigger connecting to an external server
+	connectExternalServer: async (url?: string) => {
+		if (!isLocalSource()) {
+			throw new Error('Access restricted: This operation is only allowed in a local environment.');
+		}
+		await ipcRenderer.invoke('connect-external', url); // Pass optional URL
+	},
+
 	notification: async (title: string, body: string) => {
 		await ipcRenderer.invoke('notification', { title, body });
 	}

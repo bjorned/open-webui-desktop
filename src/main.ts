@@ -12,7 +12,8 @@ import {
 	globalShortcut,
 	Notification,
 	ipcMain,
-	ipcRenderer
+	ipcRenderer,
+	MenuItemConstructorOptions
 } from 'electron';
 import path from 'path';
 import started from 'electron-squirrel-startup';
@@ -58,9 +59,13 @@ if (!gotTheLock) {
 	// Main application logic
 	let mainWindow: BrowserWindow | null = null;
 	let tray: Tray | null = null;
+	let isQuitting = false; // Use a local variable instead of attaching to app
 
-	let SERVER_URL = null;
+	let SERVER_URL: string | null = null;
 	let SERVER_STATUS = 'stopped';
+
+	const USE_EXTERNAL_SERVER = true; // Force loading external URL on start
+	const EXTERNAL_SERVER_URL = 'http://localhost:8080'; 
 
 	logEmitter.on('log', (message) => {
 		mainWindow?.webContents.send('main:log', message);
@@ -78,7 +83,7 @@ if (!gotTheLock) {
 	};
 
 	const updateTrayMenu = (status: string, url: string | null) => {
-		const trayMenuTemplate = [
+		const trayMenuTemplate: (MenuItemConstructorOptions | MenuItem)[] = [
 			{
 				label: 'Show Open WebUI',
 				accelerator: 'CommandOrControl+Alt+O',
@@ -149,7 +154,7 @@ if (!gotTheLock) {
 				label: 'Quit Open WebUI',
 				accelerator: 'CommandOrControl+Q',
 				click: () => {
-					app.isQuiting = true; // Mark as quitting
+					isQuitting = true; // Mark as quitting using local variable
 					app.quit(); // Quit the application
 				}
 			}
@@ -168,27 +173,34 @@ if (!gotTheLock) {
 		updateTrayMenu('Open WebUI: Starting...', null);
 
 		try {
-			SERVER_URL = await startServer();
-			// SERVER_URL = 'http://localhost:5050';
-
+			// Actually start the local server now
+			SERVER_URL = await startServer(); 
 			SERVER_STATUS = 'started';
+
+			// Send status updates to the renderer
+			mainWindow.webContents.send('main:data', {
+				type: 'install:status', // Assuming install is implicitly true if server starts
+				data: true
+			});
 			mainWindow.webContents.send('main:data', {
 				type: 'server:status',
 				data: SERVER_STATUS
 			});
 
+			// Handle 0.0.0.0 case if necessary (server might return this)
 			if (SERVER_URL.startsWith('http://0.0.0.0')) {
 				SERVER_URL = SERVER_URL.replace('http://0.0.0.0', 'http://localhost');
 			}
 
+			// Load the URL returned by the local server
 			mainWindow.loadURL(SERVER_URL);
-			mainWindow;
 
 			const urlObj = new URL(SERVER_URL);
-			const port = urlObj.port || '8080'; // Fallback to port 8080 if not provided
-			updateTrayMenu(`Open WebUI: Running on port ${port}`, SERVER_URL); // Update tray menu with running status
+			const port = urlObj.port || '8080'; // Default port if not specified
+			updateTrayMenu(`Open WebUI: Running on port ${port}`, SERVER_URL); 
+
 		} catch (error) {
-			console.error('Failed to start server:', error);
+			console.error('Failed to start local server:', error);
 			SERVER_STATUS = 'failed';
 			mainWindow.webContents.send('main:data', {
 				type: 'server:status',
@@ -238,28 +250,94 @@ if (!gotTheLock) {
 			{ useSystemPicker: true }
 		);
 
-		loadDefaultView();
-		if (!app.isPackaged) {
-			mainWindow.webContents.openDevTools();
-		}
+		// --- Load Correct View --- 
+		if (USE_EXTERNAL_SERVER) {
+			// Load external server directly
+			console.log(`[External Server] Attempting to load: ${EXTERNAL_SERVER_URL}`);
+			SERVER_URL = EXTERNAL_SERVER_URL;
+			SERVER_STATUS = 'started';
+			mainWindow.loadURL(EXTERNAL_SERVER_URL);
 
-		// Wait for the renderer to finish loading
-		mainWindow.webContents.once('did-finish-load', async () => {
-			console.log('Renderer finished loading');
+			// Send initial status immediately so frontend might skip launching screen
+			mainWindow.webContents.send('main:data', {
+				type: 'install:status',
+				data: true
+			});
+			mainWindow.webContents.send('main:data', {
+				type: 'server:status',
+				data: SERVER_STATUS
+			});
 
-			// Check installation and start the server
-			if (await validateInstallation()) {
-				mainWindow.webContents.send('main:data', {
-					type: 'install:status',
-					data: true
-				});
-			} else {
-				mainWindow.webContents.send('main:data', {
-					type: 'install:status',
-					data: false
-				});
+			// Listener for successful load (just for logging and updating tray)
+			mainWindow.webContents.on('did-finish-load', () => {
+				// Check if the final loaded URL is the one we intended
+				const currentURL = mainWindow.webContents.getURL();
+				// console.log(`[Event] did-finish-load: URL = ${currentURL}`); // REMOVED LOG
+				if (currentURL.startsWith(EXTERNAL_SERVER_URL)) {
+					// console.log(`[External Server] Successfully loaded: ${EXTERNAL_SERVER_URL}`); // REMOVED LOG
+					updateTrayMenu(`Open WebUI: Connected to ${EXTERNAL_SERVER_URL}`, EXTERNAL_SERVER_URL);
+				} else if (currentURL.startsWith('http://localhost:8080')) {
+					// console.log(`[Fallback] Successfully loaded via fallback: ${currentURL}`); // REMOVED LOG
+					// Tray menu updated in the fallback logic itself
+				}
+			});
+
+			// Add error handling for loadURL
+			mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+				// Only handle failures for the main frame load
+				if (!isMainFrame) return;
+
+				// console.error(`[Event] did-fail-load: URL=${validatedURL}, ErrorCode=${errorCode}, Desc=${errorDescription}`); // REMOVED LOG
+				
+				// Fallback to localhost if external server fails
+				if (validatedURL === EXTERNAL_SERVER_URL) {
+					const fallbackURL = 'http://localhost:8080';
+					// console.log(`[Fallback] Attempting to load ${fallbackURL} due to previous error...`); // REMOVED LOG
+					mainWindow.loadURL(fallbackURL)
+						.then(() => {
+							// Success log now handled by did-finish-load
+							SERVER_URL = fallbackURL;
+							updateTrayMenu(`Open WebUI: Fallback on ${fallbackURL}`, fallbackURL);
+						})
+						.catch(err => {
+							// console.error(`[Fallback] Also failed to load ${fallbackURL}:`, err); // REMOVED LOG
+							// Optionally load a local error page here
+							// mainWindow.loadFile(path.join(__dirname, 'error.html'));
+							updateTrayMenu('Open WebUI: Failed to load server', null);
+						});
+				}
+			});
+
+		} else {
+			// Load local Svelte app/dev server
+			loadDefaultView();
+			if (!app.isPackaged) {
+				mainWindow.webContents.openDevTools();
 			}
-		});
+
+			// Wait for the renderer to finish loading
+			mainWindow.webContents.once('did-finish-load', async () => {
+				console.log('[Local View] Renderer finished loading');
+
+				// Check installation and potentially start the server
+				if (await validateInstallation()) {
+					mainWindow.webContents.send('main:data', {
+						type: 'install:status',
+						data: true
+					});
+					// Automatically start server if installed but stopped?
+					// if (SERVER_STATUS === 'stopped') { 
+					// 	 await startServerHandler(); 
+					// }
+				} else {
+					mainWindow.webContents.send('main:data', {
+						type: 'install:status',
+						data: false
+					});
+				}
+			});
+		}
+		// --- End Load Correct View --- 
 
 		globalShortcut.register('Alt+CommandOrControl+O', () => {
 			mainWindow?.show();
@@ -269,7 +347,7 @@ if (!gotTheLock) {
 		});
 
 		const defaultMenu = Menu.getApplicationMenu();
-		let menuTemplate = defaultMenu ? defaultMenu.items.map((item) => item) : [];
+		let menuTemplate: (MenuItemConstructorOptions | MenuItem)[] = defaultMenu ? defaultMenu.items.map((item) => item) : [];
 		menuTemplate.push({
 			label: 'Action',
 			submenu: [
@@ -287,7 +365,7 @@ if (!gotTheLock) {
 						removePackage();
 					}
 				}
-			]
+			] as MenuItemConstructorOptions[] // Explicitly type submenu
 		});
 		const updatedMenu = Menu.buildFromTemplate(menuTemplate);
 		Menu.setApplicationMenu(updatedMenu);
@@ -313,7 +391,7 @@ if (!gotTheLock) {
 				accelerator: 'CommandOrControl+Q',
 				click: async () => {
 					await stopAllServers();
-					app.isQuiting = true; // Mark as quitting
+					isQuitting = true; // Mark as quitting using local variable
 					app.quit(); // Quit the application
 				}
 			}
@@ -324,7 +402,7 @@ if (!gotTheLock) {
 
 		// Handle the close event
 		mainWindow.on('close', (event) => {
-			if (!app.isQuiting) {
+			if (!isQuitting) { // Check local variable
 				event.preventDefault(); // Prevent the default close behavior
 				mainWindow.hide(); // Hide the window instead of closing it
 			}
@@ -332,7 +410,12 @@ if (!gotTheLock) {
 	};
 
 	ipcMain.handle('install', async (event) => {
-		console.log('Installing package...');
+		// console.log('Installing package...'); // REMOVED LOG
+		if (USE_EXTERNAL_SERVER) {
+			console.warn('Attempted to install package while USE_EXTERNAL_SERVER is true.');
+			// Optionally send back an error or status update
+			return; // Don't proceed with installation
+		}
 
 		try {
 			const res = await installPackage();
@@ -353,26 +436,30 @@ if (!gotTheLock) {
 	});
 
 	ipcMain.handle('install:status', async (event) => {
+		// console.log('[IPC] install:status'); // REMOVED LOG
+		if (USE_EXTERNAL_SERVER) return true;
 		return await validateInstallation();
 	});
 
 	ipcMain.handle('remove', async (event) => {
-		console.log('Resetting package...');
+		// console.log('Resetting package...'); // REMOVED LOG
 		removePackage();
 	});
 
 	ipcMain.handle('server:status', async (event) => {
+		// console.log('[IPC] server:status'); // REMOVED LOG
+		if (USE_EXTERNAL_SERVER) return 'started';
 		return SERVER_STATUS;
 	});
 
 	ipcMain.handle('server:start', async (event) => {
-		console.log('Starting server...');
+		// console.log('Starting server...'); // REMOVED LOG
 
 		await startServerHandler();
 	});
 
 	ipcMain.handle('server:stop', async (event) => {
-		console.log('Stopping server...');
+		// console.log('Stopping server...'); // REMOVED LOG
 
 		await stopAllServers();
 		SERVER_STATUS = 'stopped';
@@ -388,7 +475,7 @@ if (!gotTheLock) {
 	});
 
 	ipcMain.handle('renderer:data', async (event, { type, data }) => {
-		console.log('Received data from renderer:', type, data);
+		// console.log('Received data from renderer:', type, data); // REMOVED LOG
 
 		if (type === 'info') {
 			return {
@@ -403,11 +490,20 @@ if (!gotTheLock) {
 			};
 		}
 
+		// --- ADDED CHECK FOR 'app:data' ---
+		// If the loaded page asks for 'app:data', return an empty object
+		// to potentially prevent ReferenceError if the page expects something.
+		if (type === 'app:data') {
+			console.log('[IPC] Received request for app:data, returning empty object.');
+			return {}; 
+		}
+		// --- END CHECK --- 
+
 		return { type, data };
 	});
 
 	ipcMain.handle('notification', async (event, { title, body }) => {
-		console.log('Received notification:', title, body);
+		// console.log('Received notification:', title, body); // REMOVED LOG
 		const notification = new Notification({
 			title: title,
 			body: body
@@ -417,14 +513,14 @@ if (!gotTheLock) {
 
 	app.on('before-quit', async () => {
 		await stopAllServers();
-		app.isQuiting = true; // Ensure quit flag is set
+		isQuitting = true; // Ensure quit flag is set using local variable
 	});
 
 	// Quit when all windows are closed, except on macOS
 	app.on('window-all-closed', async () => {
 		if (process.platform !== 'darwin') {
 			await stopAllServers();
-			app.isQuitting = true;
+			isQuitting = true; // Set local variable
 			app.quit();
 		}
 	});
